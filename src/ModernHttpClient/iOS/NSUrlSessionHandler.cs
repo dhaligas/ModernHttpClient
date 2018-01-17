@@ -6,792 +6,651 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
-using System.Text.RegularExpressions;
-using ModernHttpClient.CoreFoundation;
-using ModernHttpClient.Foundation;
-
-#if UNIFIED
 using Foundation;
 using Security;
-#else
-using MonoTouch.Foundation;
-using MonoTouch.Security;
-using System.Globalization;
-#endif
+using CoreFoundation;
+using System.Runtime.InteropServices;
 
 namespace ModernHttpClient
 {
-    class InflightOperation
+    public partial class NativeMessageHandler : HttpClientHandler, INSUrlSessionDelegate
     {
-        public HttpRequestMessage Request { get; set; }
-        public TaskCompletionSource<HttpResponseMessage> FutureResponse { get; set; }
-        public ProgressDelegate Progress { get; set; }
-        public ByteArrayListStream ResponseBody { get; set; }
-        public CancellationToken CancellationToken { get; set; }
-        public bool IsCompleted { get; set; }
-    }
+        readonly Dictionary<string, string> headerSeparators = new Dictionary<string, string> {
+            ["User-Agent"] = " ",
+            ["Server"] = " "
+        };
 
-    public class NativeMessageHandler : HttpClientHandler
-    {
         readonly NSUrlSession session;
+        readonly Dictionary<NSUrlSessionTask, InflightData> inflightRequests;
+        readonly object inflightRequestsLock = new object ();
 
-        readonly Dictionary<NSUrlSessionTask, InflightOperation> inflightRequests = 
-            new Dictionary<NSUrlSessionTask, InflightOperation>();
+        public NativeMessageHandler () : this (false, false)
+        {
+        }
 
-        readonly Dictionary<HttpRequestMessage, ProgressDelegate> registeredProgressCallbacks = 
-            new Dictionary<HttpRequestMessage, ProgressDelegate>();
-
-        readonly Dictionary<string, string> headerSeparators =
-            new Dictionary<string, string>(){ 
-                {"User-Agent", " "}
-            };
-
-        readonly bool throwOnCaptiveNetwork;
-        readonly bool customSSLVerification;
-
-        public bool DisableCaching { get; set; }
-
-        public NativeMessageHandler(): this(false, false) { }
-        public NativeMessageHandler(bool throwOnCaptiveNetwork, bool customSSLVerification, NativeCookieHandler cookieHandler = null, SslProtocol? minimumSSLProtocol = null)
+        public NativeMessageHandler (bool throwOnCaptiveNetwork, bool customSSLVerification, NativeCookieHandler cookieHandler = null)
         {
             var configuration = NSUrlSessionConfiguration.DefaultSessionConfiguration;
 
-            // System.Net.ServicePointManager.SecurityProtocol provides a mechanism for specifying supported protocol types
-            // for System.Net. Since iOS only provides an API for a minimum and maximum protocol we are not able to port
-            // this configuration directly and instead use the specified minimum value when one is specified.
-            if (minimumSSLProtocol.HasValue) {
-                configuration.TLSMinimumSupportedProtocol = minimumSSLProtocol.Value;
-            }
+            AllowAutoRedirect = true;
 
-            session = NSUrlSession.FromConfiguration(
-                NSUrlSessionConfiguration.DefaultSessionConfiguration, 
-                new DataTaskDelegate(this), null);
+            // we cannot do a bitmask but we can set the minimum based on ServicePointManager.SecurityProtocol minimum
+            var sp = ServicePointManager.SecurityProtocol;
+            if ((sp & SecurityProtocolType.Ssl3) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Ssl_3_0;
+            else if ((sp & SecurityProtocolType.Tls) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_0;
+            else if ((sp & SecurityProtocolType.Tls11) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_1;
+            else if ((sp & SecurityProtocolType.Tls12) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_2;
 
-            this.throwOnCaptiveNetwork = throwOnCaptiveNetwork;
-            this.customSSLVerification = customSSLVerification;
-
-            this.DisableCaching = false;
+            session = NSUrlSession.FromConfiguration (configuration, this, null);
+            inflightRequests = new Dictionary<NSUrlSessionTask, InflightData> ();
         }
 
-        string getHeaderSeparator(string name)
-        {
-            if (headerSeparators.ContainsKey(name)) {
-                return headerSeparators[name];
-            }
+        public long MaxInputInMemory { get; set; } = long.MaxValue;
 
-            return ",";
+        void RemoveInflightData (NSUrlSessionTask task, bool cancel = true)
+        {
+            InflightData inflight;
+            lock (inflightRequestsLock)
+                if (inflightRequests.TryGetValue (task, out inflight))
+                    inflightRequests.Remove (task);
+
+            if (cancel)
+                task?.Cancel ();
+
+            task?.Dispose ();
         }
 
-        public void RegisterForProgress(HttpRequestMessage request, ProgressDelegate callback)
+        protected override void Dispose (bool disposing)
         {
-            if (callback == null && registeredProgressCallbacks.ContainsKey(request)) {
-                registeredProgressCallbacks.Remove(request);
-                return;
-            }
-
-            registeredProgressCallbacks[request] = callback;
-        }
-
-        ProgressDelegate getAndRemoveCallbackFromRegister(HttpRequestMessage request)
-        {
-            ProgressDelegate emptyDelegate = delegate { };
-
-            lock (registeredProgressCallbacks) {
-                if (!registeredProgressCallbacks.ContainsKey(request)) return emptyDelegate;
-
-                var callback = registeredProgressCallbacks[request];
-                registeredProgressCallbacks.Remove(request);
-                return callback;
-            }
-        }
-
-        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-        {
-            var headers = request.Headers as IEnumerable<KeyValuePair<string, IEnumerable<string>>>;
-            var ms = new MemoryStream();
-
-            if (request.Content != null) {
-                await request.Content.CopyToAsync(ms).ConfigureAwait(false);
-                headers = headers.Union(request.Content.Headers).ToArray();
-            }
-
-            var rq = new NSMutableUrlRequest() {
-                AllowsCellularAccess = true,
-                Body = NSData.FromArray(ms.ToArray()),
-                CachePolicy = (!this.DisableCaching ? NSUrlRequestCachePolicy.UseProtocolCachePolicy : NSUrlRequestCachePolicy.ReloadIgnoringCacheData),
-                Headers = headers.Aggregate(new NSMutableDictionary(), (acc, x) => {
-                    acc.Add(new NSString(x.Key), new NSString(String.Join(getHeaderSeparator(x.Key), x.Value)));
-                    return acc;
-                }),
-                HttpMethod = request.Method.ToString().ToUpperInvariant(),
-                Url = NSUrl.FromString(request.RequestUri.AbsoluteUri),
-            };
-
-            var op = session.CreateDataTask(rq);
-
-            cancellationToken.ThrowIfCancellationRequested();
-
-            var ret = new TaskCompletionSource<HttpResponseMessage>();
-            cancellationToken.Register(() => ret.TrySetCanceled());
-
-            lock (inflightRequests) {
-                inflightRequests[op] = new InflightOperation() {
-                    FutureResponse = ret,
-                    Request = request,
-                    Progress = getAndRemoveCallbackFromRegister(request),
-                    ResponseBody = new ByteArrayListStream(),
-                    CancellationToken = cancellationToken,
-                };
-            }
-
-            op.Resume();
-            return await ret.Task.ConfigureAwait(false);
-        }
-
-        class DataTaskDelegate : NSUrlSessionDataDelegate
-        {
-            NativeMessageHandler This { get; set; }
-
-            public DataTaskDelegate(NativeMessageHandler that)
-            {
-                this.This = that;
-            }
-
-            public override void DidReceiveResponse(NSUrlSession session, NSUrlSessionDataTask dataTask, NSUrlResponse response, Action<NSUrlSessionResponseDisposition> completionHandler)
-            {
-                var data = getResponseForTask(dataTask);
-
-                try {
-                    if (data.CancellationToken.IsCancellationRequested) {
-                        dataTask.Cancel();
-                    }
-
-                    var resp = (NSHttpUrlResponse)response;
-                    var req = data.Request;
-
-                    if (This.throwOnCaptiveNetwork && req.RequestUri.Host != resp.Url.Host) {
-                        throw new CaptiveNetworkException(req.RequestUri, new Uri(resp.Url.ToString()));
-                    }
-
-                    var content = new CancellableStreamContent(data.ResponseBody, () => {
-                        if (!data.IsCompleted) {
-                            dataTask.Cancel();
-                        }
-                        data.IsCompleted = true;
-
-                        data.ResponseBody.SetException(new OperationCanceledException());
-                    });
-
-                    content.Progress = data.Progress;
-
-                    // NB: The double cast is because of a Xamarin compiler bug
-                    int status = (int)resp.StatusCode;
-                    var ret = new HttpResponseMessage((HttpStatusCode)status) {
-                        Content = content,
-                        RequestMessage = data.Request,
-                    };
-                    ret.RequestMessage.RequestUri = new Uri(resp.Url.AbsoluteString);
-
-                    foreach(var v in resp.AllHeaderFields) {
-                        // NB: Cocoa trolling us so hard by giving us back dummy
-                        // dictionary entries
-                        if (v.Key == null || v.Value == null) continue;
-
-                        ret.Headers.TryAddWithoutValidation(v.Key.ToString(), v.Value.ToString());
-                        ret.Content.Headers.TryAddWithoutValidation(v.Key.ToString(), v.Value.ToString());
-                    }
-
-                    data.FutureResponse.TrySetResult(ret);
-                } catch (Exception ex) {
-                    data.FutureResponse.TrySetException(ex);
+            lock (inflightRequestsLock) {
+                foreach (var pair in inflightRequests) {
+                    pair.Key?.Cancel ();
+                    pair.Key?.Dispose ();
                 }
 
-                completionHandler(NSUrlSessionResponseDisposition.Allow);
+                inflightRequests.Clear ();
             }
 
-            public override void WillCacheResponse (NSUrlSession session, NSUrlSessionDataTask dataTask,
-                NSCachedUrlResponse proposedResponse, Action<NSCachedUrlResponse> completionHandler)
+            base.Dispose (disposing);
+        }
+
+        bool disableCaching;
+
+        public bool DisableCaching {
+            get {
+                return disableCaching;
+            }
+            set {
+                EnsureModifiability ();
+                disableCaching = value;
+            }
+        }
+
+        public IntPtr Handle => throw new NotImplementedException ();
+
+        string GetHeaderSeparator (string name)
+        {
+            string value;
+            if (!headerSeparators.TryGetValue (name, out value))
+                value = ",";
+            return value;
+        }
+
+        async Task<NSUrlRequest> CreateRequest (HttpRequestMessage request)
+        {
+            var stream = Stream.Null;
+            var headers = request.Headers as IEnumerable<KeyValuePair<string, IEnumerable<string>>>;
+
+            if (request.Content != null) {
+                stream = await request.Content.ReadAsStreamAsync ().ConfigureAwait (false);
+                headers = headers.Union (request.Content.Headers).ToArray ();
+            }
+
+            var nsrequest = new NSMutableUrlRequest {
+                AllowsCellularAccess = true,
+                CachePolicy = DisableCaching ? NSUrlRequestCachePolicy.ReloadIgnoringCacheData : NSUrlRequestCachePolicy.UseProtocolCachePolicy,
+                HttpMethod = request.Method.ToString ().ToUpperInvariant (),
+                Url = NSUrl.FromString (request.RequestUri.AbsoluteUri),
+                Headers = headers.Aggregate (new NSMutableDictionary (), (acc, x) => {
+                    acc.Add (new NSString (x.Key), new NSString (string.Join (GetHeaderSeparator (x.Key), x.Value)));
+                    return acc;
+                })
+            };
+            if (stream != Stream.Null) {
+                // HttpContent.TryComputeLength is `protected internal` :-( but it's indirectly called by headers
+                var length = request.Content.Headers.ContentLength;
+                if (length.HasValue && (length <= MaxInputInMemory))
+                    nsrequest.Body = NSData.FromStream (stream);
+                else
+                    nsrequest.BodyStream = new WrappedNSInputStream (stream);
+            }
+            return nsrequest;
+        }
+
+#if SYSTEM_NET_HTTP || MONOMAC
+       // internal
+#endif
+        protected override async Task<HttpResponseMessage> SendAsync (HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Volatile.Write (ref sentRequest, true);
+
+            var nsrequest = await CreateRequest (request).ConfigureAwait (false);
+            var dataTask = session.CreateDataTask (nsrequest);
+
+            var tcs = new TaskCompletionSource<HttpResponseMessage> ();
+
+            cancellationToken.Register (() => {
+                RemoveInflightData (dataTask);
+                tcs.TrySetCanceled ();
+            });
+
+            lock (inflightRequestsLock)
+                inflightRequests.Add (dataTask, new InflightData {
+                    RequestUrl = request.RequestUri.AbsoluteUri,
+                    CompletionSource = tcs,
+                    CancellationToken = cancellationToken,
+                    Stream = new NSUrlSessionDataTaskStream (),
+                    Request = request
+                });
+
+            if (dataTask.State == NSUrlSessionTaskState.Suspended)
+                dataTask.Resume ();
+
+            return await tcs.Task.ConfigureAwait (false);
+        }
+
+#if MONOMAC
+        // Needed since we strip during linking since we're inside a product assembly.
+        [Preserve (AllMembers = true)]
+#endif
+        partial class NSUrlSessionHandlerDelegate : NSUrlSessionDataDelegate
+        {
+            readonly NativeMessageHandler sessionHandler;
+
+            public NSUrlSessionHandlerDelegate (NativeMessageHandler handler)
             {
-                completionHandler (This.DisableCaching ? null : proposedResponse);
+                sessionHandler = handler;
+            }
+
+            InflightData GetInflightData (NSUrlSessionTask task)
+            {
+                var inflight = default (InflightData);
+
+                lock (sessionHandler.inflightRequestsLock)
+                    if (sessionHandler.inflightRequests.TryGetValue (task, out inflight)) {
+                        // ensure that we did not cancel the request, if we did, do cancel the task
+                        if (inflight.CancellationToken.IsCancellationRequested)
+                            task?.Cancel ();
+                        return inflight;
+                    }
+
+                // if we did not manage to get the inflight data, we either got an error or have been canceled, lets cancel the task, that will execute DidCompleteWithError
+                task?.Cancel ();
+                return null;
+            }
+
+            public override void DidReceiveResponse (NSUrlSession session, NSUrlSessionDataTask dataTask, NSUrlResponse response, Action<NSUrlSessionResponseDisposition> completionHandler)
+            {
+                var inflight = GetInflightData (dataTask);
+
+                if (inflight == null)
+                    return;
+
+                try {
+                    var urlResponse = (NSHttpUrlResponse)response;
+                    var status = (int)urlResponse.StatusCode;
+
+                    var content = new NSUrlSessionDataTaskStreamContent (inflight.Stream, () => {
+                        if (!inflight.Completed) {
+                            dataTask.Cancel ();
+                        }
+
+                        inflight.Disposed = true;
+                        inflight.Stream.TrySetException (new ObjectDisposedException ("The content stream was disposed."));
+
+                        sessionHandler.RemoveInflightData (dataTask);
+                    }, inflight.CancellationToken);
+
+                    // NB: The double cast is because of a Xamarin compiler bug
+                    var httpResponse = new HttpResponseMessage ((HttpStatusCode)status) {
+                        Content = content,
+                        RequestMessage = inflight.Request
+                    };
+                    httpResponse.RequestMessage.RequestUri = new Uri (urlResponse.Url.AbsoluteString);
+
+                    foreach (var v in urlResponse.AllHeaderFields) {
+                        // NB: Cocoa trolling us so hard by giving us back dummy dictionary entries
+                        if (v.Key == null || v.Value == null) continue;
+
+                        httpResponse.Headers.TryAddWithoutValidation (v.Key.ToString (), v.Value.ToString ());
+                        httpResponse.Content.Headers.TryAddWithoutValidation (v.Key.ToString (), v.Value.ToString ());
+                    }
+
+                    inflight.Response = httpResponse;
+
+                    // We don't want to send the response back to the task just yet.  Because we want to mimic .NET behavior
+                    // as much as possible.  When the response is sent back in .NET, the content stream is ready to read or the
+                    // request has completed, because of this we want to send back the response in DidReceiveData or DidCompleteWithError
+                    if (dataTask.State == NSUrlSessionTaskState.Suspended)
+                        dataTask.Resume ();
+
+                } catch (Exception ex) {
+                    inflight.CompletionSource.TrySetException (ex);
+                    inflight.Stream.TrySetException (ex);
+
+                    sessionHandler.RemoveInflightData (dataTask);
+                }
+
+                completionHandler (NSUrlSessionResponseDisposition.Allow);
+            }
+
+            public override void DidReceiveData (NSUrlSession session, NSUrlSessionDataTask dataTask, NSData data)
+            {
+                var inflight = GetInflightData (dataTask);
+
+                if (inflight == null)
+                    return;
+
+                inflight.Stream.Add (data);
+                SetResponse (inflight);
             }
 
             public override void DidCompleteWithError (NSUrlSession session, NSUrlSessionTask task, NSError error)
             {
-                var data = getResponseForTask(task);
-                data.IsCompleted = true;
+                var inflight = GetInflightData (task);
 
-                if (error != null) {
-                    var ex = createExceptionForNSError(error);
+                // this can happen if the HTTP request times out and it is removed as part of the cancellation process
+                if (inflight != null) {
+                    // set the stream as finished
+                    inflight.Stream.TrySetReceivedAllData ();
 
-                    // Pass the exception to the response
-                    data.FutureResponse.TrySetException(ex);
-                    data.ResponseBody.SetException(ex);
+                    // send the error or send the response back
+                    if (error != null) {
+                        inflight.Errored = true;
+
+                        var exc = createExceptionForNSError (error);
+                        inflight.CompletionSource.TrySetException (exc);
+                        inflight.Stream.TrySetException (exc);
+                    } else {
+                        inflight.Completed = true;
+                        SetResponse (inflight);
+                    }
+
+                    sessionHandler.RemoveInflightData (task, cancel: false);
+                }
+            }
+
+            void SetResponse (InflightData inflight)
+            {
+                lock (inflight.Lock) {
+                    if (inflight.ResponseSent)
+                        return;
+
+                    if (inflight.CompletionSource.Task.IsCompleted)
+                        return;
+
+                    var httpResponse = inflight.Response;
+
+                    inflight.ResponseSent = true;
+
+                    // EVIL HACK: having TrySetResult inline was blocking the request from completing
+                    Task.Run (() => inflight.CompletionSource.TrySetResult (httpResponse));
+                }
+            }
+
+            public override void WillCacheResponse (NSUrlSession session, NSUrlSessionDataTask dataTask, NSCachedUrlResponse proposedResponse, Action<NSCachedUrlResponse> completionHandler)
+            {
+                completionHandler (sessionHandler.DisableCaching ? null : proposedResponse);
+            }
+
+            public override void WillPerformHttpRedirection (NSUrlSession session, NSUrlSessionTask task, NSHttpUrlResponse response, NSUrlRequest newRequest, Action<NSUrlRequest> completionHandler)
+            {
+                completionHandler (sessionHandler.AllowAutoRedirect ? newRequest : null);
+            }
+
+            public override void DidReceiveChallenge (NSUrlSession session, NSUrlSessionTask task, NSUrlAuthenticationChallenge challenge, Action<NSUrlSessionAuthChallengeDisposition, NSUrlCredential> completionHandler)
+            {
+                var inflight = GetInflightData (task);
+
+                if (inflight == null)
                     return;
+
+                // case for the basic auth failing up front. As per apple documentation:
+                // The URL Loading System is designed to handle various aspects of the HTTP protocol for you. As a result, you should not modify the following headers using
+                // the addValue(_:forHTTPHeaderField:) or setValue(_:forHTTPHeaderField:) methods:
+                //  Authorization
+                //  Connection
+                //  Host
+                //  Proxy-Authenticate
+                //  Proxy-Authorization
+                //  WWW-Authenticate
+                // but we are hiding such a situation from our users, we can nevertheless know if the header was added and deal with it. The idea is as follows,
+                // check if we are in the first attempt, if we are (PreviousFailureCount == 0), we check the headers of the request and if we do have the Auth 
+                // header, it means that we do not have the correct credentials, in any other case just do what it is expected.
+
+                if (challenge.PreviousFailureCount == 0) {
+                    var authHeader = inflight.Request?.Headers?.Authorization;
+                    if (!(string.IsNullOrEmpty (authHeader?.Scheme) && string.IsNullOrEmpty (authHeader?.Parameter))) {
+                        completionHandler (NSUrlSessionAuthChallengeDisposition.RejectProtectionSpace, null);
+                        return;
+                    }
                 }
-
-                data.ResponseBody.Complete();
-
-                lock (This.inflightRequests) {
-                    This.inflightRequests.Remove(task);
-                }
-            }
-
-            public override void DidReceiveData (NSUrlSession session, NSUrlSessionDataTask dataTask, NSData byteData)
-            {
-                var data = getResponseForTask(dataTask);
-                var bytes = byteData.ToArray();
-
-                // NB: If we're cancelled, we still might have one more chunk 
-                // of data that attempts to be delivered
-                if (data.IsCompleted) return;
-
-                data.ResponseBody.AddByteArray(bytes);
-            }
-
-            InflightOperation getResponseForTask(NSUrlSessionTask task)
-            {
-                lock (This.inflightRequests) {
-                    return This.inflightRequests[task];
-                }
-            }
-
-            static readonly Regex cnRegex = new Regex(@"CN\s*=\s*([^,]*)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Singleline);
-
-            public override void DidReceiveChallenge(NSUrlSession session, NSUrlSessionTask task, NSUrlAuthenticationChallenge challenge, Action<NSUrlSessionAuthChallengeDisposition, NSUrlCredential> completionHandler)
-            {
-               
 
                 if (challenge.ProtectionSpace.AuthenticationMethod == NSUrlProtectionSpace.AuthenticationMethodNTLM) {
-                    NetworkCredential credentialsToUse;
-
-                    if (This.Credentials != null) {
-                        if (This.Credentials is NetworkCredential) {
-                            credentialsToUse = (NetworkCredential)This.Credentials;
-                        } else {
-                            var uri = this.getResponseForTask(task).Request.RequestUri;
-                            credentialsToUse = This.Credentials.GetCredential(uri, "NTLM");
+                    if (sessionHandler.Credentials != null) {
+                        var credentialsToUse = sessionHandler.Credentials as NetworkCredential;
+                        if (credentialsToUse == null) {
+                            var uri = inflight.Request.RequestUri;
+                            credentialsToUse = sessionHandler.Credentials.GetCredential (uri, "NTLM");
                         }
-                        var credential = new NSUrlCredential(credentialsToUse.UserName, credentialsToUse.Password, NSUrlCredentialPersistence.ForSession);
-                        completionHandler(NSUrlSessionAuthChallengeDisposition.UseCredential, credential);
+                        var credential = new NSUrlCredential (credentialsToUse.UserName, credentialsToUse.Password, NSUrlCredentialPersistence.ForSession);
+                        completionHandler (NSUrlSessionAuthChallengeDisposition.UseCredential, credential);
                     }
                     return;
                 }
-
-                if (!This.customSSLVerification) {
-                    goto doDefault;
-                }
-
-                if (challenge.ProtectionSpace.AuthenticationMethod != "NSURLAuthenticationMethodServerTrust") {
-                    goto doDefault;
-                }
-
-                if (ServicePointManager.ServerCertificateValidationCallback == null) {
-                    goto doDefault;
-                }
-
-                // Convert Mono Certificates to .NET certificates and build cert 
-                // chain from root certificate
-                var serverCertChain = challenge.ProtectionSpace.ServerSecTrust;
-                var chain = new X509Chain();
-                X509Certificate2 root = null;
-                var errors = SslPolicyErrors.None;
-
-                if (serverCertChain == null || serverCertChain.Count == 0) { 
-                    errors = SslPolicyErrors.RemoteCertificateNotAvailable;
-                    goto sslErrorVerify;
-                }
-
-                if (serverCertChain.Count == 1) {
-                    errors = SslPolicyErrors.RemoteCertificateChainErrors;
-                    goto sslErrorVerify;
-                }
-
-                var netCerts = Enumerable.Range(0, serverCertChain.Count)
-                    .Select(x => serverCertChain[x].ToX509Certificate2())
-                    .ToArray();
-
-                for (int i = 1; i < netCerts.Length; i++) {
-                    chain.ChainPolicy.ExtraStore.Add(netCerts[i]);
-                }
-
-                root = netCerts[0];
-
-                chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
-                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan(0, 1, 0);
-                chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
-
-                if (!chain.Build(root)) {
-                    errors = SslPolicyErrors.RemoteCertificateChainErrors;
-                    goto sslErrorVerify;
-                }
-
-                var subject = root.Subject;
-                var subjectCn = cnRegex.Match(subject).Groups[1].Value;
-
-                if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(task.CurrentRequest.Url.Host, subjectCn)) {
-                    errors = SslPolicyErrors.RemoteCertificateNameMismatch;
-                    goto sslErrorVerify;
-                }
-
-            sslErrorVerify:
-                var hostname = task.CurrentRequest.Url.Host;
-                bool result = ServicePointManager.ServerCertificateValidationCallback(hostname, root, chain, errors);
-                if (result) {
-                    completionHandler(
-                        NSUrlSessionAuthChallengeDisposition.UseCredential,
-                        NSUrlCredential.FromTrust(challenge.ProtectionSpace.ServerSecTrust));
-                } else {
-                    completionHandler(NSUrlSessionAuthChallengeDisposition.CancelAuthenticationChallenge, null);
-                }
-                return;
-
-            doDefault:
-                completionHandler(NSUrlSessionAuthChallengeDisposition.PerformDefaultHandling, challenge.ProposedCredential);
-                return;
+                completionHandler (NSUrlSessionAuthChallengeDisposition.PerformDefaultHandling, challenge.ProposedCredential);
             }
+        }
 
-            public override void WillPerformHttpRedirection(NSUrlSession session, NSUrlSessionTask task, NSHttpUrlResponse response, NSUrlRequest newRequest, Action<NSUrlRequest> completionHandler)
+#if MONOMAC
+        // Needed since we strip during linking since we're inside a product assembly.
+        [Preserve (AllMembers = true)]
+#endif
+        class InflightData
+        {
+            public readonly object Lock = new object ();
+            public string RequestUrl { get; set; }
+
+            public TaskCompletionSource<HttpResponseMessage> CompletionSource { get; set; }
+            public CancellationToken CancellationToken { get; set; }
+            public NSUrlSessionDataTaskStream Stream { get; set; }
+            public HttpRequestMessage Request { get; set; }
+            public HttpResponseMessage Response { get; set; }
+
+            public bool ResponseSent { get; set; }
+            public bool Errored { get; set; }
+            public bool Disposed { get; set; }
+            public bool Completed { get; set; }
+            public bool Done { get { return Errored || Disposed || Completed || CancellationToken.IsCancellationRequested; } }
+        }
+
+#if MONOMAC
+        // Needed since we strip during linking since we're inside a product assembly.
+        [Preserve (AllMembers = true)]
+#endif
+        class NSUrlSessionDataTaskStreamContent : StreamContent
+        {
+            Action disposed;
+
+            public NSUrlSessionDataTaskStreamContent (NSUrlSessionDataTaskStream source, Action onDisposed, CancellationToken token) : base (source)
             {
-                NSUrlRequest nextRequest = (This.AllowAutoRedirect ? newRequest : null);
-                completionHandler(nextRequest);
+                disposed = onDisposed;
             }
 
-            static Exception createExceptionForNSError(NSError error)
+            protected override void Dispose (bool disposing)
             {
-                var ret = default(Exception);
-                var webExceptionStatus = WebExceptionStatus.UnknownError;
+                var action = Interlocked.Exchange (ref disposed, null);
+                action?.Invoke ();
 
-                var innerException = new NSErrorException(error);
+                base.Dispose (disposing);
+            }
+        }
 
-                if (error.Domain == NSError.NSUrlErrorDomain) {
-                    // Convert the error code into an enumeration (this is future
-                    // proof, rather than just casting integer)
-                    NSUrlErrorExtended urlError;
-                    if (!Enum.TryParse<NSUrlErrorExtended>(error.Code.ToString(), out urlError)) urlError = NSUrlErrorExtended.Unknown;
+#if MONOMAC
+        // Needed since we strip during linking since we're inside a product assembly.
+        [Preserve (AllMembers = true)]
+#endif
+        class NSUrlSessionDataTaskStream : Stream
+        {
+            readonly Queue<NSData> data;
+            readonly object dataLock = new object ();
 
-                    // Parse the enum into a web exception status or exception. Some
-                    // of these values don't necessarily translate completely to
-                    // what WebExceptionStatus supports, so made some best guesses
-                    // here.  For your reading pleasure, compare these:
-                    //
-                    // Apple docs: https://developer.apple.com/library/mac/documentation/Cocoa/Reference/Foundation/Miscellaneous/Foundation_Constants/index.html#//apple_ref/doc/constant_group/URL_Loading_System_Error_Codes
-                    // .NET docs: http://msdn.microsoft.com/en-us/library/system.net.webexceptionstatus(v=vs.110).aspx
-                    switch (urlError) {
-                    case NSUrlErrorExtended.Cancelled:
-                    case NSUrlErrorExtended.UserCancelledAuthentication:
-                        // No more processing is required so just return.
-                        return new OperationCanceledException(error.LocalizedDescription, innerException);
-                    case NSUrlErrorExtended.BadURL:
-                    case NSUrlErrorExtended.UnsupportedURL:
-                    case NSUrlErrorExtended.CannotConnectToHost:
-                    case NSUrlErrorExtended.ResourceUnavailable:
-                    case NSUrlErrorExtended.NotConnectedToInternet:
-                    case NSUrlErrorExtended.UserAuthenticationRequired:
-                    case NSUrlErrorExtended.InternationalRoamingOff:
-                    case NSUrlErrorExtended.CallIsActive:
-                    case NSUrlErrorExtended.DataNotAllowed:
-                        webExceptionStatus = WebExceptionStatus.ConnectFailure;
-                        break;
-                    case NSUrlErrorExtended.TimedOut:
-                        webExceptionStatus = WebExceptionStatus.Timeout;
-                        break;
-                    case NSUrlErrorExtended.CannotFindHost:
-                    case NSUrlErrorExtended.DNSLookupFailed:
-                        webExceptionStatus = WebExceptionStatus.NameResolutionFailure;
-                        break;
-                    case NSUrlErrorExtended.DataLengthExceedsMaximum:
-                        webExceptionStatus = WebExceptionStatus.MessageLengthLimitExceeded;
-                        break;
-                    case NSUrlErrorExtended.NetworkConnectionLost:
-                        webExceptionStatus = WebExceptionStatus.ConnectionClosed;
-                        break;
-                    case NSUrlErrorExtended.HTTPTooManyRedirects:
-                    case NSUrlErrorExtended.RedirectToNonExistentLocation:
-                        webExceptionStatus = WebExceptionStatus.ProtocolError;
-                        break;
-                    case NSUrlErrorExtended.RequestBodyStreamExhausted:
-                        webExceptionStatus = WebExceptionStatus.SendFailure;
-                        break;
-                    case NSUrlErrorExtended.BadServerResponse:
-                    case NSUrlErrorExtended.ZeroByteResource:
-                    case NSUrlErrorExtended.CannotDecodeRawData:
-                    case NSUrlErrorExtended.CannotDecodeContentData:
-                    case NSUrlErrorExtended.CannotParseResponse:
-                    case NSUrlErrorExtended.FileDoesNotExist:
-                    case NSUrlErrorExtended.FileIsDirectory:
-                    case NSUrlErrorExtended.NoPermissionsToReadFile:
-                    case NSUrlErrorExtended.CannotLoadFromNetwork:
-                    case NSUrlErrorExtended.CannotCreateFile:
-                    case NSUrlErrorExtended.CannotOpenFile:
-                    case NSUrlErrorExtended.CannotCloseFile:
-                    case NSUrlErrorExtended.CannotWriteToFile:
-                    case NSUrlErrorExtended.CannotRemoveFile:
-                    case NSUrlErrorExtended.CannotMoveFile:
-                    case NSUrlErrorExtended.DownloadDecodingFailedMidStream:
-                    case NSUrlErrorExtended.DownloadDecodingFailedToComplete:
-                        webExceptionStatus = WebExceptionStatus.ReceiveFailure;
-                        break;
-                    case NSUrlErrorExtended.SecureConnectionFailed:
-                        webExceptionStatus = WebExceptionStatus.SecureChannelFailure;
-                        break;
-                    case NSUrlErrorExtended.ServerCertificateHasBadDate:
-                    case NSUrlErrorExtended.ServerCertificateHasUnknownRoot:
-                    case NSUrlErrorExtended.ServerCertificateNotYetValid:
-                    case NSUrlErrorExtended.ServerCertificateUntrusted:
-                    case NSUrlErrorExtended.ClientCertificateRejected:
-                    case NSUrlErrorExtended.ClientCertificateRequired:
-                        webExceptionStatus = WebExceptionStatus.TrustFailure;
-                        break;
-                    }
+            long position;
+            long length;
 
-                    goto done;
-                } 
+            bool receivedAllData;
+            Exception exc;
 
-                if (error.Domain == CFNetworkError.ErrorDomain) {
-                    // Convert the error code into an enumeration (this is future
-                    // proof, rather than just casting integer)
-                    CFNetworkErrors networkError;
-                    if (!Enum.TryParse<CFNetworkErrors>(error.Code.ToString(), out networkError)) {
-                        networkError = CFNetworkErrors.CFHostErrorUnknown;
-                    }
+            NSData current;
+            Stream currentStream;
 
-                    // Parse the enum into a web exception status or exception. Some
-                    // of these values don't necessarily translate completely to
-                    // what WebExceptionStatus supports, so made some best guesses
-                    // here.  For your reading pleasure, compare these:
-                    //
-                    // Apple docs: https://developer.apple.com/library/ios/documentation/Networking/Reference/CFNetworkErrors/#//apple_ref/c/tdef/CFNetworkErrors
-                    // .NET docs: http://msdn.microsoft.com/en-us/library/system.net.webexceptionstatus(v=vs.110).aspx
-                    switch (networkError) {
-                    case CFNetworkErrors.CFURLErrorCancelled:
-                    case CFNetworkErrors.CFURLErrorUserCancelledAuthentication:
-                    case CFNetworkErrors.CFNetServiceErrorCancel:
-                        // No more processing is required so just return.
-                        return new OperationCanceledException(error.LocalizedDescription, innerException);
-                    case CFNetworkErrors.CFSOCKS5ErrorBadCredentials:
-                    case CFNetworkErrors.CFSOCKS5ErrorUnsupportedNegotiationMethod:
-                    case CFNetworkErrors.CFSOCKS5ErrorNoAcceptableMethod:
-                    case CFNetworkErrors.CFErrorHttpAuthenticationTypeUnsupported:
-                    case CFNetworkErrors.CFErrorHttpBadCredentials:
-                    case CFNetworkErrors.CFErrorHttpBadURL:
-                    case CFNetworkErrors.CFURLErrorBadURL:
-                    case CFNetworkErrors.CFURLErrorUnsupportedURL:
-                    case CFNetworkErrors.CFURLErrorCannotConnectToHost:
-                    case CFNetworkErrors.CFURLErrorResourceUnavailable:
-                    case CFNetworkErrors.CFURLErrorNotConnectedToInternet:
-                    case CFNetworkErrors.CFURLErrorUserAuthenticationRequired:
-                    case CFNetworkErrors.CFURLErrorInternationalRoamingOff:
-                    case CFNetworkErrors.CFURLErrorCallIsActive:
-                    case CFNetworkErrors.CFURLErrorDataNotAllowed:
-                        webExceptionStatus = WebExceptionStatus.ConnectFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorTimedOut:
-                    case CFNetworkErrors.CFNetServiceErrorTimeout:
-                        webExceptionStatus = WebExceptionStatus.Timeout;
-                        break;
-                    case CFNetworkErrors.CFHostErrorHostNotFound:
-                    case CFNetworkErrors.CFURLErrorCannotFindHost:
-                    case CFNetworkErrors.CFURLErrorDNSLookupFailed:
-                    case CFNetworkErrors.CFNetServiceErrorDNSServiceFailure:
-                        webExceptionStatus = WebExceptionStatus.NameResolutionFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorDataLengthExceedsMaximum:
-                        webExceptionStatus = WebExceptionStatus.MessageLengthLimitExceeded;
-                        break;
-                    case CFNetworkErrors.CFErrorHttpConnectionLost:
-                    case CFNetworkErrors.CFURLErrorNetworkConnectionLost:
-                        webExceptionStatus = WebExceptionStatus.ConnectionClosed;
-                        break;
-                    case CFNetworkErrors.CFErrorHttpRedirectionLoopDetected:
-                    case CFNetworkErrors.CFURLErrorHTTPTooManyRedirects:
-                    case CFNetworkErrors.CFURLErrorRedirectToNonExistentLocation:
-                        webExceptionStatus = WebExceptionStatus.ProtocolError;
-                        break;
-                    case CFNetworkErrors.CFSOCKSErrorUnknownClientVersion:
-                    case CFNetworkErrors.CFSOCKSErrorUnsupportedServerVersion:
-                    case CFNetworkErrors.CFErrorHttpParseFailure:
-                    case CFNetworkErrors.CFURLErrorRequestBodyStreamExhausted:
-                        webExceptionStatus = WebExceptionStatus.SendFailure;
-                        break;
-                    case CFNetworkErrors.CFSOCKS4ErrorRequestFailed:
-                    case CFNetworkErrors.CFSOCKS4ErrorIdentdFailed:
-                    case CFNetworkErrors.CFSOCKS4ErrorIdConflict:
-                    case CFNetworkErrors.CFSOCKS4ErrorUnknownStatusCode:
-                    case CFNetworkErrors.CFSOCKS5ErrorBadState:
-                    case CFNetworkErrors.CFSOCKS5ErrorBadResponseAddr:
-                    case CFNetworkErrors.CFURLErrorBadServerResponse:
-                    case CFNetworkErrors.CFURLErrorZeroByteResource:
-                    case CFNetworkErrors.CFURLErrorCannotDecodeRawData:
-                    case CFNetworkErrors.CFURLErrorCannotDecodeContentData:
-                    case CFNetworkErrors.CFURLErrorCannotParseResponse:
-                    case CFNetworkErrors.CFURLErrorFileDoesNotExist:
-                    case CFNetworkErrors.CFURLErrorFileIsDirectory:
-                    case CFNetworkErrors.CFURLErrorNoPermissionsToReadFile:
-                    case CFNetworkErrors.CFURLErrorCannotLoadFromNetwork:
-                    case CFNetworkErrors.CFURLErrorCannotCreateFile:
-                    case CFNetworkErrors.CFURLErrorCannotOpenFile:
-                    case CFNetworkErrors.CFURLErrorCannotCloseFile:
-                    case CFNetworkErrors.CFURLErrorCannotWriteToFile:
-                    case CFNetworkErrors.CFURLErrorCannotRemoveFile:
-                    case CFNetworkErrors.CFURLErrorCannotMoveFile:
-                    case CFNetworkErrors.CFURLErrorDownloadDecodingFailedMidStream:
-                    case CFNetworkErrors.CFURLErrorDownloadDecodingFailedToComplete:
-                    case CFNetworkErrors.CFHTTPCookieCannotParseCookieFile:
-                    case CFNetworkErrors.CFNetServiceErrorUnknown:
-                    case CFNetworkErrors.CFNetServiceErrorCollision:
-                    case CFNetworkErrors.CFNetServiceErrorNotFound:
-                    case CFNetworkErrors.CFNetServiceErrorInProgress:
-                    case CFNetworkErrors.CFNetServiceErrorBadArgument:
-                    case CFNetworkErrors.CFNetServiceErrorInvalid:
-                        webExceptionStatus = WebExceptionStatus.ReceiveFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorServerCertificateHasBadDate:
-                    case CFNetworkErrors.CFURLErrorServerCertificateUntrusted:
-                    case CFNetworkErrors.CFURLErrorServerCertificateHasUnknownRoot:
-                    case CFNetworkErrors.CFURLErrorServerCertificateNotYetValid:
-                    case CFNetworkErrors.CFURLErrorClientCertificateRejected:
-                    case CFNetworkErrors.CFURLErrorClientCertificateRequired:
-                        webExceptionStatus = WebExceptionStatus.TrustFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorSecureConnectionFailed:
-                        webExceptionStatus = WebExceptionStatus.SecureChannelFailure;
-                        break;
-                    case CFNetworkErrors.CFErrorHttpProxyConnectionFailure:
-                    case CFNetworkErrors.CFErrorHttpBadProxyCredentials:
-                    case CFNetworkErrors.CFErrorPACFileError:
-                    case CFNetworkErrors.CFErrorPACFileAuth:
-                    case CFNetworkErrors.CFErrorHttpsProxyConnectionFailure:
-                    case CFNetworkErrors.CFStreamErrorHttpsProxyFailureUnexpectedResponseToConnectMethod:
-                        webExceptionStatus = WebExceptionStatus.RequestProhibitedByProxy;
-                        break;
-                    }
+            public NSUrlSessionDataTaskStream ()
+            {
+                data = new Queue<NSData> ();
+            }
 
-                    goto done;
+            protected override void Dispose (bool disposing)
+            {
+                lock (dataLock) {
+                    foreach (var q in data)
+                        q?.Dispose ();
                 }
 
-            done:
-
-                // Always create a WebException so that it can be handled by the client.
-                ret = new WebException(error.LocalizedDescription, innerException, webExceptionStatus, response: null);
-                return ret;
-            }
-        }
-    }
-            
-    class ByteArrayListStream : Stream
-    {
-        Exception exception;
-        IDisposable lockRelease;
-        readonly AsyncLock readStreamLock;
-        readonly List<byte[]> bytes = new List<byte[]>();
-
-        bool isCompleted;
-        long maxLength = 0;
-        long position = 0;
-        int offsetInCurrentBuffer = 0;
-
-        public ByteArrayListStream()
-        {
-            // Initially we have nothing to read so Reads should be parked
-            readStreamLock = AsyncLock.CreateLocked(out lockRelease);
-        }
-
-        public override bool CanRead { get { return true; } }
-        public override bool CanWrite { get { return false; } }
-        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
-        public override void WriteByte(byte value) { throw new NotSupportedException(); }
-        public override bool CanSeek { get { return false; } }
-        public override bool CanTimeout { get { return false; } }
-        public override void SetLength(long value) { throw new NotSupportedException(); }
-        public override void Flush() { }
-
-        public override long Seek(long offset, SeekOrigin origin)
-        { 
-            throw new NotSupportedException();
-        }
-
-        public override long Position {
-            get { return position; }
-            set {
-                throw new NotSupportedException();
-            }
-        }
-
-        public override long Length {
-            get {
-                return maxLength;
-            }
-        }
-
-        public override int Read(byte[] buffer, int offset, int count)
-        {
-            return this.ReadAsync(buffer, offset, count).Result;
-        }
-
-        /* OMG THIS CODE IS COMPLICATED
-         *
-         * Here's the core idea. We want to create a ReadAsync function that
-         * reads from our list of byte arrays **until it gets to the end of
-         * our current list**.
-         *
-         * If we're not there yet, we keep returning data, serializing access
-         * to the underlying position pointer (i.e. we definitely don't want
-         * people concurrently moving position along). If we try to read past
-         * the end, we return the section of data we could read and complete
-         * it.
-         *
-         * Here's where the tricky part comes in. If we're not Completed (i.e.
-         * the caller still wants to add more byte arrays in the future) and
-         * we're at the end of the current stream, we want to *block* the read
-         * (not blocking, but async blocking whatever you know what I mean),
-         * until somebody adds another byte[] to chew through, or if someone
-         * rewinds the position.
-         *
-         * If we *are* completed, we should return zero to simply complete the
-         * read, signalling we're at the end of the stream */
-        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-        {
-        retry:
-            int bytesRead = 0;
-            int buffersToRemove = 0;
-
-            if (isCompleted && position == maxLength) {
-                return 0;
+                base.Dispose (disposing);
             }
 
-            if (exception != null) throw exception;
+            public void Add (NSData d)
+            {
+                lock (dataLock) {
+                    data.Enqueue (d);
+                    length += (int)d.Length;
+                }
+            }
 
-            using (await readStreamLock.LockAsync().ConfigureAwait(false)) {
-                lock (bytes) {
-                    foreach (var buf in bytes) {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if (exception != null) throw exception;
+            public void TrySetReceivedAllData ()
+            {
+                receivedAllData = true;
+            }
 
-                        int toCopy = Math.Min(count, buf.Length - offsetInCurrentBuffer);
-                        Array.ConstrainedCopy(buf, offsetInCurrentBuffer, buffer, offset, toCopy);
+            public void TrySetException (Exception e)
+            {
+                exc = e;
+                TrySetReceivedAllData ();
+            }
 
-                        count -= toCopy;
-                        offset += toCopy;
-                        bytesRead += toCopy;
+            void ThrowIfNeeded (CancellationToken cancellationToken)
+            {
+                if (exc != null)
+                    throw exc;
 
-                        offsetInCurrentBuffer += toCopy;
+                cancellationToken.ThrowIfCancellationRequested ();
+            }
 
-                        if (offsetInCurrentBuffer >= buf.Length) {
-                            offsetInCurrentBuffer = 0;
-                            buffersToRemove++;
+            public override int Read (byte [] buffer, int offset, int count)
+            {
+                return ReadAsync (buffer, offset, count).Result;
+            }
+
+            public override async Task<int> ReadAsync (byte [] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                // try to throw on enter
+                ThrowIfNeeded (cancellationToken);
+
+                while (current == null) {
+                    lock (dataLock) {
+                        if (data.Count == 0 && receivedAllData && position == length)
+                            return 0;
+
+                        if (data.Count > 0 && current == null) {
+                            current = data.Peek ();
+                            currentStream = current.AsStream ();
+                            break;
                         }
-
-                        if (count <= 0) break;
                     }
 
-                    // Remove buffers that we read in this operation
-                    bytes.RemoveRange(0, buffersToRemove);
-
-                    position += bytesRead;
+                    await Task.Delay (50).ConfigureAwait (false);
                 }
+
+                // try to throw again before read
+                ThrowIfNeeded (cancellationToken);
+
+                var d = currentStream;
+                var bufferCount = Math.Min (count, (int)(d.Length - d.Position));
+                var bytesRead = await d.ReadAsync (buffer, offset, bufferCount, cancellationToken).ConfigureAwait (false);
+
+                // add the bytes read from the pointer to the position
+                position += bytesRead;
+
+                // remove the current primary reference if the current position has reached the end of the bytes
+                if (d.Position == d.Length) {
+                    lock (dataLock) {
+                        // this is the same object, it was done to make the cleanup
+                        data.Dequeue ();
+                        current?.Dispose ();
+                        currentStream?.Dispose ();
+                        current = null;
+                        currentStream = null;
+                    }
+                }
+
+                return bytesRead;
             }
 
-            // If we're at the end of the stream and it's not done, prepare
-            // the next read to park itself unless AddByteArray or Complete 
-            // posts
-            if (position >= maxLength && !isCompleted) {
-                lockRelease = await readStreamLock.LockAsync().ConfigureAwait(false);
+            public override bool CanRead => true;
+
+            public override bool CanSeek => false;
+
+            public override bool CanWrite => false;
+
+            public override bool CanTimeout => false;
+
+            public override long Length => length;
+
+            public override void SetLength (long value)
+            {
+                throw new InvalidOperationException ();
             }
 
-            if (bytesRead == 0 && !isCompleted) {
-                // NB: There are certain race conditions where we somehow acquire
-                // the lock yet are at the end of the stream, and we're not completed
-                // yet. We should try again so that we can get stuck in the lock.
-                goto retry;
+            public override long Position {
+                get { return position; }
+                set { throw new InvalidOperationException (); }
             }
 
-            if (cancellationToken.IsCancellationRequested) {
-                Interlocked.Exchange(ref lockRelease, EmptyDisposable.Instance).Dispose();
-                cancellationToken.ThrowIfCancellationRequested();
+            public override long Seek (long offset, SeekOrigin origin)
+            {
+                throw new InvalidOperationException ();
             }
 
-            if (exception != null) {
-                Interlocked.Exchange(ref lockRelease, EmptyDisposable.Instance).Dispose();
-                throw exception;
+            public override void Flush ()
+            {
+                throw new InvalidOperationException ();
             }
 
-            if (isCompleted && position < maxLength) {
-                // NB: This solves a rare deadlock 
-                //
-                // 1. ReadAsync called (waiting for lock release)
-                // 2. AddByteArray called (release lock)
-                // 3. AddByteArray called (release lock)
-                // 4. Complete called (release lock the last time)
-                // 5. ReadAsync called (lock released at this point, the method completed successfully) 
-                // 6. ReadAsync called (deadlock on LockAsync(), because the lock is block, and there is no way to release it)
-                // 
-                // Current condition forces the lock to be released in the end of 5th point
-
-                Interlocked.Exchange(ref lockRelease, EmptyDisposable.Instance).Dispose();
+            public override void Write (byte [] buffer, int offset, int count)
+            {
+                throw new InvalidOperationException ();
             }
-
-            return bytesRead;
         }
 
-        public void AddByteArray(byte[] arrayToAdd)
+#if MONOMAC
+        // Needed since we strip during linking since we're inside a product assembly.
+        [Preserve (AllMembers = true)]
+#endif
+        class WrappedNSInputStream : NSInputStream
         {
-            if (exception != null) throw exception;
-            if (isCompleted) throw new InvalidOperationException("Can't add byte arrays once Complete() is called");
+            NSStreamStatus status;
+            CFRunLoopSource source;
+            readonly Stream stream;
+            bool notifying;
 
-            lock (bytes) {
-                maxLength += arrayToAdd.Length;
-                bytes.Add(arrayToAdd);
-                //Console.WriteLine("Added a new byte array, {0}: max = {1}", arrayToAdd.Length, maxLength);
+            public WrappedNSInputStream (Stream inputStream)
+            {
+                status = NSStreamStatus.NotOpen;
+                stream = inputStream;
+                source = new CFRunLoopSource (Handle);
             }
 
-            Interlocked.Exchange(ref lockRelease, EmptyDisposable.Instance).Dispose();
+            public override NSStreamStatus Status => status;
+
+            public override void Open ()
+            {
+                status = NSStreamStatus.Open;
+                Notify (CFStreamEventType.OpenCompleted);
+            }
+
+            public override void Close ()
+            {
+                status = NSStreamStatus.Closed;
+            }
+
+            public override nint Read (IntPtr buffer, nuint len)
+            {
+                var sourceBytes = new byte [len];
+                var read = stream.Read (sourceBytes, 0, (int)len);
+                Marshal.Copy (sourceBytes, 0, buffer, (int)len);
+
+                if (notifying)
+                    return read;
+
+                notifying = true;
+                if (stream.CanSeek && stream.Position == stream.Length) {
+                    Notify (CFStreamEventType.EndEncountered);
+                    status = NSStreamStatus.AtEnd;
+                }
+                notifying = false;
+
+                return read;
+            }
+
+            public override bool HasBytesAvailable ()
+            {
+                return true;
+            }
+
+            protected override bool GetBuffer (out IntPtr buffer, out nuint len)
+            {
+                // Just call the base implemention (which will return false)
+                return base.GetBuffer (out buffer, out len);
+            }
+
+            // NSInvalidArgumentException Reason: *** -propertyForKey: only defined for abstract class.  Define -[System_Net_Http_NSUrlSessionHandler_WrappedNSInputStream propertyForKey:]!
+            protected override NSObject GetProperty (NSString key)
+            {
+                return null;
+            }
+
+            protected override bool SetProperty (NSObject property, NSString key)
+            {
+                return false;
+            }
+
+            protected override bool SetCFClientFlags (CFStreamEventType inFlags, IntPtr inCallback, IntPtr inContextPtr)
+            {
+                // Just call the base implementation, which knows how to handle everything.
+                return base.SetCFClientFlags (inFlags, inCallback, inContextPtr);
+            }
+
+            public override void Schedule (NSRunLoop aRunLoop, string mode)
+            {
+                var cfRunLoop = aRunLoop.GetCFRunLoop ();
+                var nsMode = new NSString (mode);
+
+                cfRunLoop.AddSource (source, nsMode);
+
+                if (notifying)
+                    return;
+
+                notifying = true;
+                Notify (CFStreamEventType.HasBytesAvailable);
+                notifying = false;
+            }
+
+            public override void Unschedule (NSRunLoop aRunLoop, string mode)
+            {
+                var cfRunLoop = aRunLoop.GetCFRunLoop ();
+                var nsMode = new NSString (mode);
+
+                cfRunLoop.RemoveSource (source, nsMode);
+            }
+
+            protected override void Dispose (bool disposing)
+            {
+                stream?.Dispose ();
+            }
         }
-
-        public void Complete()
-        {
-            isCompleted = true;
-            Interlocked.Exchange(ref lockRelease, EmptyDisposable.Instance).Dispose();
-        }
-
-        public void SetException(Exception ex)
-        {
-            exception = ex;
-            Complete();
-        }
-    }
-
-    sealed class CancellableStreamContent : ProgressStreamContent
-    {
-        Action onDispose;
-
-        public CancellableStreamContent(Stream source, Action onDispose) : base(source, CancellationToken.None)
-        {
-            this.onDispose = onDispose;
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            var disp = Interlocked.Exchange(ref onDispose, null);
-            if (disp != null) disp();
-
-            // EVIL HAX: We have to let at least one ReadAsync of the underlying
-            // stream fail with OperationCancelledException before we can dispose
-            // the base, or else the exception coming out of the ReadAsync will
-            // be an ObjectDisposedException from an internal MemoryStream. This isn't
-            // the Ideal way to fix this, but #yolo.
-            Task.Run(() => base.Dispose(disposing));
-        }
-    }
-
-    sealed class EmptyDisposable : IDisposable
-    {
-        static readonly IDisposable instance = new EmptyDisposable();
-        public static IDisposable Instance { get { return instance; } }
-
-        EmptyDisposable() { }
-        public void Dispose() { }
     }
 }
