@@ -10,10 +10,13 @@ using Foundation;
 using Security;
 using CoreFoundation;
 using System.Runtime.InteropServices;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Text.RegularExpressions;
 
 namespace ModernHttpClient
 {
-    public partial class NativeMessageHandler : HttpClientHandler, INSUrlSessionDelegate
+    public partial class NativeMessageHandler : HttpClientHandler
     {
         readonly Dictionary<string, string> headerSeparators = new Dictionary<string, string> {
             ["User-Agent"] = " ",
@@ -24,6 +27,9 @@ namespace ModernHttpClient
         readonly Dictionary<NSUrlSessionTask, InflightData> inflightRequests;
         readonly object inflightRequestsLock = new object ();
 
+        readonly bool throwOnCaptiveNetwork;
+        readonly bool customSSLVerification;
+
         public NativeMessageHandler () : this (false, false)
         {
         }
@@ -33,6 +39,9 @@ namespace ModernHttpClient
             var configuration = NSUrlSessionConfiguration.DefaultSessionConfiguration;
 
             AllowAutoRedirect = true;
+
+            this.throwOnCaptiveNetwork = throwOnCaptiveNetwork;
+            this.customSSLVerification = customSSLVerification;
 
             // we cannot do a bitmask but we can set the minimum based on ServicePointManager.SecurityProtocol minimum
             var sp = ServicePointManager.SecurityProtocol;
@@ -45,7 +54,7 @@ namespace ModernHttpClient
             else if ((sp & SecurityProtocolType.Tls12) != 0)
                 configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_2;
 
-            session = NSUrlSession.FromConfiguration (configuration, this, null);
+            session = NSUrlSession.FromConfiguration (configuration, (INSUrlSessionDataDelegate)new NSUrlSessionHandlerDelegate (this), null);
             inflightRequests = new Dictionary<NSUrlSessionTask, InflightData> ();
         }
 
@@ -312,6 +321,8 @@ namespace ModernHttpClient
                 completionHandler (sessionHandler.AllowAutoRedirect ? newRequest : null);
             }
 
+            static readonly Regex cnRegex = new Regex (@"CN\s*=\s*([^,]*)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Singleline);
+
             public override void DidReceiveChallenge (NSUrlSession session, NSUrlSessionTask task, NSUrlAuthenticationChallenge challenge, Action<NSUrlSessionAuthChallengeDisposition, NSUrlCredential> completionHandler)
             {
                 var inflight = GetInflightData (task);
@@ -332,13 +343,13 @@ namespace ModernHttpClient
                 // check if we are in the first attempt, if we are (PreviousFailureCount == 0), we check the headers of the request and if we do have the Auth 
                 // header, it means that we do not have the correct credentials, in any other case just do what it is expected.
 
-                if (challenge.PreviousFailureCount == 0) {
-                    var authHeader = inflight.Request?.Headers?.Authorization;
-                    if (!(string.IsNullOrEmpty (authHeader?.Scheme) && string.IsNullOrEmpty (authHeader?.Parameter))) {
-                        completionHandler (NSUrlSessionAuthChallengeDisposition.RejectProtectionSpace, null);
-                        return;
-                    }
-                }
+                //if (challenge.PreviousFailureCount == 0) {
+                //    var authHeader = inflight.Request?.Headers?.Authorization;
+                //    if (!(string.IsNullOrEmpty (authHeader?.Scheme) && string.IsNullOrEmpty (authHeader?.Parameter))) {
+                //        completionHandler (NSUrlSessionAuthChallengeDisposition.RejectProtectionSpace, null);
+                //        return;
+                //    }
+                //}
 
                 if (challenge.ProtectionSpace.AuthenticationMethod == NSUrlProtectionSpace.AuthenticationMethodNTLM) {
                     if (sessionHandler.Credentials != null) {
@@ -352,7 +363,79 @@ namespace ModernHttpClient
                     }
                     return;
                 }
+
+                if (!sessionHandler.customSSLVerification) {
+                    goto doDefault;
+                }
+
+                if (ServicePointManager.ServerCertificateValidationCallback == null) {
+                    goto doDefault;
+                }
+
+                // Convert Mono Certificates to .NET certificates and build cert 
+                // chain from root certificate
+                var serverCertChain = challenge.ProtectionSpace.ServerSecTrust;
+                var chain = new X509Chain ();
+                X509Certificate2 root = null;
+                var errors = SslPolicyErrors.None;
+
+                if (serverCertChain == null || serverCertChain.Count == 0) {
+                    errors = SslPolicyErrors.RemoteCertificateNotAvailable;
+                    goto sslErrorVerify;
+                }
+
+                if (serverCertChain.Count == 1) {
+                    errors = SslPolicyErrors.RemoteCertificateChainErrors;
+                    goto sslErrorVerify;
+                }
+
+                var netCerts = Enumerable.Range (0, serverCertChain.Count)
+                    .Select (x => serverCertChain [x].ToX509Certificate2 ())
+                    .ToArray ();
+
+                for (int i = 1; i < netCerts.Length; i++) {
+                    chain.ChainPolicy.ExtraStore.Add (netCerts [i]);
+                }
+
+                root = netCerts [0];
+
+                chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
+                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan (0, 1, 0);
+                chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+
+                if (!chain.Build (root)) {
+                    errors = SslPolicyErrors.RemoteCertificateChainErrors;
+                    goto sslErrorVerify;
+                }
+
+                var subject = root.Subject;
+                var subjectCn = cnRegex.Match (subject).Groups [1].Value;
+
+                if (String.IsNullOrWhiteSpace (subjectCn) || !Utility.MatchHostnameToPattern (task.CurrentRequest.Url.Host, subjectCn)) {
+                    errors = SslPolicyErrors.RemoteCertificateNameMismatch;
+                    goto sslErrorVerify;
+                }
+
+                goto sslErrorVerify;
+
+            sslErrorVerify:
+                System.Diagnostics.Debug.WriteLine ("ssl verify");
+
+                var hostname = task.CurrentRequest.Url.Host;
+                bool result = ServicePointManager.ServerCertificateValidationCallback (hostname, root, chain, errors);
+                if (result) {
+                    completionHandler (
+                        NSUrlSessionAuthChallengeDisposition.UseCredential,
+                        NSUrlCredential.FromTrust (challenge.ProtectionSpace.ServerSecTrust));
+                } else {
+                    completionHandler (NSUrlSessionAuthChallengeDisposition.CancelAuthenticationChallenge, null);
+                }
+                return;
+
+            doDefault:
                 completionHandler (NSUrlSessionAuthChallengeDisposition.PerformDefaultHandling, challenge.ProposedCredential);
+                return;
             }
         }
 

@@ -34,16 +34,16 @@ namespace Playground.iOS
             //This API is only available in Mono and Xamarin products.
             //You can filter and/or re-order the ciphers suites that the SSL/TLS server will accept from a client.
             //The following example removes weak (export) ciphers from the list that will be offered to the server.
-            ServicePointManager.ClientCipherSuitesCallback += (protocol, allCiphers) =>
-                allCiphers.Where(x => !x.Contains("EXPORT")).ToList();
+        
 
             //Here we accept any certificate and just print the cert's data.
-            ServicePointManager.ServerCertificateValidationCallback += (sender, certificate, chain, sslPolicyErrors) => {
-                System.Diagnostics.Debug.WriteLine("Callback Server Certificate: " + sslPolicyErrors);
 
-                foreach(var el in chain.ChainElements) {
-                    System.Diagnostics.Debug.WriteLine(el.Certificate.GetCertHashString());
-                    System.Diagnostics.Debug.WriteLine(el.Information);
+            ServicePointManager.ServerCertificateValidationCallback += (sender, certificate, chain, sslPolicyErrors) => {
+                System.Diagnostics.Debug.WriteLine ("Callback Server Certificate: " + sslPolicyErrors);
+
+                foreach (var el in chain.ChainElements) {
+                    System.Diagnostics.Debug.WriteLine (el.Certificate.GetCertHashString ());
+                    System.Diagnostics.Debug.WriteLine (el.Information);
                 }
 
                 return true;
@@ -72,7 +72,7 @@ namespace Playground.iOS
 
         async partial void doIt (Foundation.NSObject sender)
         {
-            var handler = new NativeMessageHandler();
+            var handler = new NativeMessageHandler(false, true);
             var client = new HttpClient(handler);
 
             currentToken = new CancellationTokenSource();
@@ -85,7 +85,7 @@ namespace Playground.iOS
              
 
                 var request = new HttpRequestMessage(HttpMethod.Get, url);
-                handler.RegisterForProgress(request, HandleDownloadProgress);
+               // handler.RegisterForProgress(request, HandleDownloadProgress);
 
                 //if using NTLM authentication pass the credentials below
                 //handler.Credentials = new NetworkCredential("user","pass");
